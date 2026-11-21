@@ -23,6 +23,10 @@ type URL struct {
 
 	// the filename in which the match was found
 	Filename string `json:"filename,omitempty"`
+
+	// the parse tree node the match came from; used to derive
+	// position information. Not serialized.
+	node *Node
 }
 
 // GetURLs searches the JavaScript source code for absolute and relative URLs and returns
@@ -93,6 +97,10 @@ func (a *Analyzer) GetURLs() []*URL {
 				}
 			}
 			match.QueryParams = unique(match.QueryParams)
+
+			// remember which node the match came from so that
+			// position information can be derived later
+			match.node = n
 
 			matches = append(matches, match)
 		}

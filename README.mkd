@@ -204,3 +204,27 @@ Running the example:
 Because we have a syntax tree available for the entire JavaScript source,
 it was possible to inspect both the `key` and `value`, and also to easily
 provide the parent object as context for the match.
+
+## Structured Findings
+
+For a single-pass, structured view of everything `jsluice` can extract,
+the library offers `ExtractFindings` and `AggregateFindings` (used by the
+command-line tool's [`report` mode](/cmd/jsluice/#structured-reports)):
+
+```go
+analyzer := jsluice.NewAnalyzer(source)
+findings, warnings := analyzer.ExtractFindings()
+report := jsluice.AggregateFindings(source, "app.js", findings, warnings, jsluice.AggregateOptions{
+    Mask: true, // mask credential values and scrub them from context snippets
+})
+```
+
+The report groups results into `endpoint`, `urlLiteral`, `credential`,
+`internalDomain` and `comment` kinds (all always present, even when
+empty), attaches byte-offset/line/column locations with a context
+snippet, and merges duplicate values while keeping their occurrence
+count and first position. The classification rules
+(`jsluice.ClassifyURL`, `jsluice.IsInternalDomain`) and the masking rule
+(`jsluice.MaskSensitive`) are exported so other output paths can reuse
+the exact same definitions.
+

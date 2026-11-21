@@ -45,6 +45,13 @@ type options struct {
 	rawOutput       bool
 	includeFilename bool
 	format          bool
+
+	// report
+	kindsFlag  string
+	kinds      map[jsluice.FindingKind]bool
+	unmask     bool
+	partial    bool
+	outputFile string
 }
 
 const (
@@ -53,6 +60,7 @@ const (
 	modeTree    = "tree"
 	modeQuery   = "query"
 	modeFormat  = "format"
+	modeReport  = "report"
 )
 
 type stringSlice []string
@@ -86,6 +94,8 @@ func init() {
 			"  tree      Print syntax trees for input files",
 			"  query     Run tree-sitter a query against input files",
 			"  format    Format JavaScript source using jsbeautifier-go",
+			"  report    One structured JSON report per file: endpoints, URL literals,",
+			"            credentials, internal domains and comments, with positions",
 			"",
 			"Global options:",
 			"  -c, --concurrency int        Number of files to process concurrently (default 1)",
@@ -110,6 +120,14 @@ func init() {
 			"  -r, --raw-output             Do not convert values to native types",
 			"  -f, --include-filename       Include the filename in the output",
 			"  -F, --format                 Format source code in the output",
+			"",
+			"Report mode:",
+			"      --kinds <a,b,c>          Only include these finding kinds:",
+			"                               endpoint, urlLiteral, credential, internalDomain, comment",
+			"      --unmask                 Show full sensitive values (masked by default)",
+			"      --partial                Extract from files with syntax errors instead of skipping them",
+			"  -o, --output <file>          Write output to a file (written atomically)",
+			"  -p, --patterns <file>        JSON file containing user-defined secret patterns to look for",
 			"",
 			"Examples:",
 			"  jsluice urls -C 'auth=true; user=admin;' -H 'Specific-Header-One: true' -H 'Specific-Header-Two: false' local_file.js https://remote.host/example.js",
@@ -150,9 +168,24 @@ func main() {
 	flag.BoolVarP(&opts.includeFilename, "include-filename", "f", false, "Include the filename in the output")
 	flag.BoolVarP(&opts.format, "format", "F", false, "Format source code in the output")
 
+	// report options
+	flag.StringVar(&opts.kindsFlag, "kinds", "", "Comma-separated finding kinds to include (endpoint,urlLiteral,credential,internalDomain,comment)")
+	flag.BoolVar(&opts.unmask, "unmask", false, "Show full sensitive values instead of masked ones")
+	flag.BoolVar(&opts.partial, "partial", false, "Extract from files with syntax errors instead of skipping them")
+	flag.StringVarP(&opts.outputFile, "output", "o", "", "Write output to this file (written atomically)")
+
 	flag.Parse()
 
 	opts.headers = headers
+
+	if opts.kindsFlag != "" {
+		kinds, err := parseKinds(opts.kindsFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(2)
+		}
+		opts.kinds = kinds
+	}
 
 	if opts.help {
 		flag.Usage()
@@ -174,11 +207,20 @@ func main() {
 	mode := args[0]
 	files := args[1:]
 
-	// spin up an output worker
+	// spin up an output worker. When -o/--output is given the sink
+	// writes to a temporary file and only renames it into place once
+	// everything succeeded, so a failed run leaves no half-written file.
+	sink, err := newOutputSink(opts.outputFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(3)
+	}
+
 	output := make(chan string)
 	errs := make(chan error)
 	done := make(chan any)
 
+	var sinkErr error
 	go func() {
 
 		for {
@@ -187,7 +229,10 @@ func main() {
 				if out == "" {
 					continue
 				}
-				fmt.Println(out)
+				if err := sink.WriteLine(out); err != nil && sinkErr == nil {
+					sinkErr = err
+					fmt.Fprintf(os.Stderr, "error: failed to write output: %s\n", err)
+				}
 			case err := <-errs:
 				fmt.Fprintf(os.Stderr, "error: %s\n", err)
 			case <-done:
@@ -204,6 +249,7 @@ func main() {
 		modeTree:    printTree,
 		modeQuery:   runQuery,
 		modeFormat:  format,
+		modeReport:  extractReport,
 	}
 
 	if _, exists := modes[mode]; !exists {
@@ -289,6 +335,15 @@ func main() {
 	done <- struct{}{}
 	close(output)
 	close(errs)
+
+	if sinkErr != nil {
+		sink.Abort()
+		os.Exit(3)
+	}
+	if err := sink.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to finalize output: %s\n", err)
+		os.Exit(3)
+	}
 
 }
 

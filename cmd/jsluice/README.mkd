@@ -47,6 +47,7 @@ of expressions like this are replaced with `EXPR` by default, but that can be ch
     * [Printing Syntax Trees](#printing-syntax-trees)
     * [Running Queries](#running-queries)
     * [Formatting JavaScript Source](#formatting-javascript-source)
+    * [Structured Reports](#structured-reports)
     * [Using remote files over HTTP](#requesting-files-from-remote-hosts)
     * [Using WARC files](#using-warc-files)
     * [Getting help](#help)
@@ -79,12 +80,13 @@ You can also provide files one-per-line on `stdin`:
 find . -name '*.js' | jsluice <mode> [options]
 ```
 
-`jsluice` has five modes:
+`jsluice` has six modes:
 * `urls` - for extracting URLs and paths
 * `secrets` - for finding secrets and so on
 * `tree` - for printing syntax trees
 * `query` - for running tree-sitter queries
 * `format` - for formatting JavaScript source
+* `report` - for a single structured report per file covering all of the above
 
 Output is in [JSONL](https://jsonlines.org/) format. Piping `jsluice` to a tool
 like [jq](https://jqlang.github.io/jq/) allows for human-readable formatting,
@@ -431,6 +433,100 @@ let logout = () => {
 }
 ```
 
+### Structured Reports
+
+The `report` mode runs every extractor in a single pass and emits one
+structured JSON report per input file, instead of running `urls`,
+`secrets` and `query` separately and stitching the results together
+yourself:
+
+```
+▶ jsluice report app.js | jq
+{
+  "source": "app.js",
+  "findings": {
+    "endpoint": [
+      {
+        "kind": "endpoint",
+        "value": "https://api.example.com/v1/users?role=admin",
+        "detail": "GET fetch",
+        "location": {
+          "offset": 109,
+          "endOffset": 178,
+          "line": 3,
+          "column": 1,
+          "context": "…fetch(\"https://api.example.com/v1/users?role=admin\", {method…"
+        },
+        "count": 3
+      }
+    ],
+    "urlLiteral": [ ... ],
+    "credential": [
+      {
+        "kind": "credential",
+        "value": "AKIA****LE",
+        "detail": "AWSAccessKey (low)",
+        "location": { "offset": 83, "endOffset": 105, "line": 2, "column": 20, "context": "\"AKIA****LE\"" },
+        "count": 1
+      }
+    ],
+    "internalDomain": [ ... ],
+    "comment": [ ... ]
+  },
+  "counts": { "endpoint": 1, "urlLiteral": 2, "credential": 1, "internalDomain": 0, "comment": 1 },
+  "skipped": false
+}
+```
+
+Findings are grouped into five kinds, which always appear in the report
+even when empty, so "no hits" is distinguishable from "not scanned":
+
+* `endpoint` - URLs the code actually uses (fetch, XHR, $.ajax, location assignments, ...)
+* `urlLiteral` - URL-looking string literals with no known usage context
+* `credential` - suspected secrets (API keys, tokens, ...)
+* `internalDomain` - hostnames that look internal (private IPs, `.local`/`.corp`/... names, bare hostnames, localhost)
+* `comment` - source code comments
+
+Each finding carries a `location`: byte `offset`/`endOffset` into the
+source, 1-based `line`/`column`, and a bounded `context` snippet. Byte
+offsets are the reliable anchor for minified single-line files. Duplicate
+values within a kind are merged into one finding whose `count` is the
+number of distinct source locations it appeared at and whose `location`
+is the first of them.
+
+Report-specific options:
+
+* `--kinds endpoint,credential` - only include the listed kinds (the others remain in the report, empty)
+* `--unmask` - show full sensitive values. By default credential values are masked (`AKIA****LE`), and any detected secret is also masked out of every finding's `context` snippet
+* `--partial` - extract from files that have syntax errors instead of skipping them (see below)
+* `-o, --output <file>` - write the JSONL output to a file. The file is written to a temporary name and renamed into place only after the whole run succeeded, so a failed run never leaves a half-written output file
+* `-p, --patterns <file>` - user-defined secret patterns, as in `secrets` mode
+
+Degraded inputs are reported, not fatal; other files continue to be
+processed:
+
+* Files with syntax errors are skipped by default: the report has
+  `"skipped": true` and a `skipReason`. With `--partial` they are
+  analyzed anyway and carry a warning instead, because tree-sitter is
+  error-tolerant and partial results are often still useful.
+* Files that are not valid UTF-8 are decoded when the encoding can be
+  identified (UTF-8/UTF-16 BOMs) and the report's `encoding` field says
+  so; positions then refer to the decoded UTF-8 content. Files whose
+  encoding cannot be identified are skipped with a `skipReason`, and
+  show up as skipped reports you can count.
+
+Known limitations:
+
+* Like the other modes, `report` holds one file's source in memory per
+  worker while tree-sitter parses it (the parser is incremental; no
+  whole-buffer regex passes are added by the report layer). Bound memory
+  for huge files with `-c`.
+* `internalDomain` is a heuristic: it errs towards marking unknown
+  hostnames as internal.
+* With `-c` greater than 1, per-file reports are printed as files
+  finish, so their order is not deterministic. Each individual report
+  line is always complete.
+
 ### Requesting files from remote hosts:
 `jsluice` will detect when an argument is passed to the tool that begins with `http://` or `https://`. These arguments will be used to retrieve the associated files, and work on them in the same process as the local files.
 
@@ -498,28 +594,44 @@ Modes:
   secrets   Extract secrets and other interesting bits
   tree      Print syntax trees for input files
   query     Run tree-sitter a query against input files
+  format    Format JavaScript source using jsbeautifier-go
+  report    One structured JSON report per file: endpoints, URL literals,
+            credentials, internal domains and comments, with positions
 
 Global options:
   -c, --concurrency int        Number of files to process concurrently (default 1)
   -C, --cookie string          Cookies to use when making requests to the specified HTTP based arguments
   -H, --header string          Headers to use when making requests to the specified HTTP based arguments (can be specified multiple times)
   -P, --placeholder string     Set the expression placeholder to a custom string (default 'EXPR')
+  -j, --raw-input              Read raw JavaScript source from stdin
   -w, --warc                   Treat the input files as WARC (Web ARChive) files
+  -i, --no-check-certificate	Ignore validation of server certificates
 
 URLs mode:
   -I, --ignore-strings         Ignore matches from string literals
   -S, --include-source         Include the source code where the URL was found
   -R, --resolve-paths <url>    Resolve relative paths using the absolute URL provided
+  -u, --unique                 Only output each URL once per input file
 
 Secrets mode:
   -p, --patterns <file>        JSON file containing user-defined secret patterns to look for
 
 Query mode:
   -q, --query <query>          Tree sitter query to run; e.g. '(string) @matches'
-  -r, --raw-output             Do not JSON-encode query output
+  -r, --raw-output             Do not convert values to native types
+  -f, --include-filename       Include the filename in the output
+  -F, --format                 Format source code in the output
+
+Report mode:
+      --kinds <a,b,c>          Only include these finding kinds:
+                               endpoint, urlLiteral, credential, internalDomain, comment
+      --unmask                 Show full sensitive values (masked by default)
+      --partial                Extract from files with syntax errors instead of skipping them
+  -o, --output <file>          Write output to a file (written atomically)
+  -p, --patterns <file>        JSON file containing user-defined secret patterns to look for
 
 Examples:
   jsluice urls -C 'auth=true; user=admin;' -H 'Specific-Header-One: true' -H 'Specific-Header-Two: false' local_file.js https://remote.host/example.js
   jsluice query -q '(object) @m' one.js two.js
-  find . -name *.js' | jsluice secrets -c 5 --patterns=apikeys.json
+  find . -name '*.js' | jsluice secrets -c 5 --patterns=apikeys.json
 ```

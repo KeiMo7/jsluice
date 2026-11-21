@@ -12,6 +12,10 @@ type Secret struct {
 	Filename string   `json:"filename,omitempty"`
 	Severity Severity `json:"severity"`
 	Context  any      `json:"context"`
+
+	// the parse tree node the match came from; used to derive
+	// position information. Not serialized.
+	node *Node
 }
 
 // Severity indicates how serious a finding is
@@ -72,6 +76,10 @@ func (a *Analyzer) GetSecrets() []*Secret {
 			if match == nil {
 				continue
 			}
+
+			// remember which node the match came from so that
+			// position information can be derived later
+			match.node = n
 
 			out = append(out, match)
 		}
