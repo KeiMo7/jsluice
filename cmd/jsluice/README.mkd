@@ -49,6 +49,7 @@ of expressions like this are replaced with `EXPR` by default, but that can be ch
     * [Formatting JavaScript Source](#formatting-javascript-source)
     * [Using remote files over HTTP](#requesting-files-from-remote-hosts)
     * [Using WARC files](#using-warc-files)
+    * [Reusing analysis results with the cache](#reusing-analysis-results-with-the-cache)
     * [Getting help](#help)
 
 ## Install
@@ -481,6 +482,127 @@ When the `-w`/`--warc` flag is specified, `jsluice` treats the input files as
   "filename": "https://example.com/blog/"
 }
 ```
+
+### Reusing analysis results with the cache
+
+Front-end code changes slowly: when a site ships hundreds of scripts, typically only two or three
+differ from one analysis run to the next. The on-disk analysis cache lets `jsluice` reuse the
+results for every unchanged script and only re-analyse the ones that actually changed.
+
+The cache is **opt-in** and only applies to the `urls` and `secrets` modes. Without `--cache` the
+single-shot analysis path is untouched, no cache files are created, and output and exit codes are
+exactly as before.
+
+#### Enabling the cache
+
+Pass a directory with `--cache`; it is created if it does not exist:
+
+```
+▶ jsluice urls --cache .jsluice-cache --cache-stats $(find . -name '*.js')
+```
+
+The first (cold) run analyses everything and stores one entry per distinct script. The second
+(warm) run reuses the unchanged entries. `--cache-stats` writes one JSON object to **stderr**
+after the run (the JSONL results on stdout are never altered):
+
+```
+cache stats: {"inputs":300,"reused":297,"recomputed":3,"forced_invalidations":0,"corrupt_entries_ignored":0,"entries_evicted":0,"scripts_added":0,"scripts_removed":1,"scripts_changed":3,"degraded":false,"cache_entries_total":303}
+```
+
+* `reused` — results served from the cache without re-parsing
+* `recomputed` — scripts analysed from scratch (new, changed, invalidated, or stale-rule)
+* `scripts_added` / `scripts_removed` / `scripts_changed` — reconciled against the previous run
+* `corrupt_entries_ignored` — entries that could not be decoded and were recomputed
+* `entries_evicted` — entries dropped to respect the size bound
+* `degraded` — `true` when the cache directory was unusable and the run fell back to no caching
+
+#### How identity and versioning work
+
+* **Identity is the SHA-256 of the exact script bytes**, never the path. The same path holding
+  different content is treated as a different script; identical content at different paths shares
+  one entry. A one-line change therefore changes the identity and forces a recomputation.
+* Every entry carries a **rule version** (`RuleVersion` in the code). When the built-in matchers
+  change, the constant is bumped and every entry written by an older version is automatically
+  treated as a miss and recomputed — old results are never reused after a rule upgrade.
+* Entries also carry a **configuration hash** covering every option that changes analysis output:
+  the expression placeholder (`-P`) and, for `secrets` mode, the contents of the `-p` patterns
+  file. Changing either of those invalidates the affected entries. Presentation-only options
+  (`-R`, `-u`, `-S`, `-I`, `-f`) are deliberately *not* part of the key because they do not change
+  the underlying analysis; they are re-applied to the cached matches at output time.
+
+#### Seeing what changed
+
+`--cache-diff` writes one JSON object per changed script to stderr, listing the raw match objects
+that were added or removed relative to the previous content at the same path:
+
+```
+cache diff: {"name":"app.js","old_hash":"8880dcc0…","new_hash":"4e672e21…","added":["{\"url\":\"/api/c\",…}"],"removed":null}
+```
+
+Deleted scripts are reported in `scripts_removed`. Their cache entries (and hence their historical
+results) are retained on disk; they are simply dropped from the current run's manifest so they no
+longer contribute to current conclusions.
+
+#### Forcing a single entry to be recomputed
+
+If one cached result is suspected to be wrong, invalidate just that entry by content hash without
+touching the rest of the cache:
+
+```
+▶ jsluice urls --cache .jsluice-cache --invalidate 4e672e214f5ab66e6bc4c36ef55cbd2a8757ba5bc2177f5808944c4c0798137c app.js
+```
+
+`--invalidate` is repeatable. The hash is the SHA-256 of the script's bytes
+(`sha256sum app.js`), the same value used as the entry filename inside the cache directory, so an
+entry can also be recomputed simply by deleting its file.
+
+#### Cache growth and cleanup
+
+The cache grows one entry per distinct script. `--cache-max-entries` (default `5000`) bounds the
+number of entry files; beyond it, least-recently-used entries are evicted at the end of each run.
+Recency is tracked in a single `lru.json` index. Set the value to `0` to disable eviction.
+
+#### Reliability guarantees
+
+* **Atomic writes.** Each entry, manifest, and the LRU index is written to a temp file in the same
+  directory, fsynced, and atomically renamed. A killed process leaves either the previous complete
+  file or the new complete file — never a truncated one.
+* **Corruption.** An entry that cannot be decoded produces a warning on stderr, is counted in
+  `corrupt_entries_ignored`, and is recomputed. A corrupt cache can never change the analysis
+  result.
+* **Unwritable directory.** If the cache directory cannot be created or written, a warning is
+  emitted once and the run degrades to normal uncached analysis (`degraded: true`).
+* **Concurrent modification.** For local files, the file is re-read after analysis and its hash
+  compared with the bytes that were analysed. If it changed mid-run, the stale result is discarded
+  and the file is re-read and re-analysed once; if it changes again, the run reports an explicit
+  error rather than emitting a result for the wrong content. HTTP and WARC inputs are in-memory
+  snapshots and cannot change underneath the analysis.
+* **Concurrency.** Goroutines inside one process are serialised by a mutex; separate `jsluice`
+  processes sharing a cache directory are serialised by an exclusive `flock`, which the kernel
+  releases automatically if a process dies, so a crash can never wedge the cache. With
+  `-c 1` output is byte-identical run to run; with higher concurrency the content is identical and
+  only the line ordering varies, exactly as without caching.
+
+#### Line numbers
+
+`jsluice`'s `URL` and `Secret` result types carry no line or column numbers — results describe the
+matched content, its type, and surrounding data, not a source position. There is therefore no
+line-drift problem: when a script changes, its new content hash forces a fresh analysis, and the
+recomputed results are correct for the new content without any position translation.
+
+#### Compatibility with existing data and behaviour
+
+* The cache is a new, additive layer in the command-line tool. The `jsluice` Go package itself is
+  unchanged, as are the `tree`, `query`, and `format` modes (passing `--cache` to those modes is an
+  explicit error rather than a silent no-op).
+* An older cache directory written by a future/newer rule version, or by different analysis
+  options, is self-describing: version and config-hash mismatches are treated as misses and
+  overwritten. There is no migration step; the first run with a new version simply recomputes.
+* Cached output is produced by the same presentation code as uncached output, so the emitted JSONL
+  is semantically identical (and, in single-threaded mode, byte-identical). One caveat inherited
+  from the original code, not introduced by caching: `queryParams`/`bodyParams` ordering comes from
+  Go map iteration in the existing `unique()` helper and was already nondeterministic between
+  uncached runs; caching does not make this worse and in practice makes repeated runs more stable.
 
 ### Help
 
