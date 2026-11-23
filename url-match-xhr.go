@@ -59,15 +59,16 @@ func matchXHR() URLMatcher {
 		}
 
 		urlArg := arguments.NamedChild(1)
-		if !urlArg.IsStringy() {
+		if !urlArg.HasStaticString() {
 			return nil
 		}
 
 		match := &URL{
-			URL:    urlArg.CollapsedString(),
-			Method: method,
-			Type:   "XMLHttpRequest.open",
-			Source: n.Content(),
+			URL:        urlArg.CollapsedString(),
+			Method:     method,
+			Type:       "XMLHttpRequest.open",
+			Source:     n.Content(),
+			sourceNode: urlArg,
 		}
 
 		// to find headers we need to look for calls to setRequestHeader() on

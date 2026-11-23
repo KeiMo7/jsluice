@@ -7,9 +7,12 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -45,6 +48,38 @@ type options struct {
 	rawOutput       bool
 	includeFilename bool
 	format          bool
+
+	// resolver follows relative imports for cross-file static evaluation.
+	// It is shared by all workers so a config module is parsed once.
+	resolver *jsluice.ModuleResolver
+
+	// skipErrors skips files whose JavaScript does not parse cleanly instead
+	// of emitting partial results for them.
+	skipErrors bool
+
+	// stats accumulates end-of-run counters for --skip-errors. It is a
+	// pointer because options is passed by value to the mode functions; the
+	// counter must be shared across worker copies.
+	stats *runStats
+}
+
+// runStats accumulates end-of-run counters reported on stderr. Access is
+// guarded by mu because files are processed concurrently.
+type runStats struct {
+	mu            sync.Mutex
+	skippedSyntax int
+}
+
+func (s *runStats) skipSyntax() {
+	s.mu.Lock()
+	s.skippedSyntax++
+	s.mu.Unlock()
+}
+
+func (s *runStats) skipped() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.skippedSyntax
 }
 
 const (
@@ -95,6 +130,7 @@ func init() {
 			"  -j, --raw-input              Read raw JavaScript source from stdin",
 			"  -w, --warc                   Treat the input files as WARC (Web ARChive) files",
 			"  -i, --no-check-certificate	Ignore validation of server certificates",
+			"      --skip-errors            Skip files that do not parse cleanly (reported as a count on stderr)",
 			"",
 			"URLs mode:",
 			"  -I, --ignore-strings         Ignore matches from string literals",
@@ -134,6 +170,7 @@ func main() {
 	flag.BoolVarP(&opts.help, "help", "h", false, "")
 	flag.BoolVarP(&opts.warc, "warc", "w", false, "")
 	flag.BoolVarP(&opts.certCheck, "no-check-certificate", "i", false, "Ignore validation of server certificates")
+	flag.BoolVar(&opts.skipErrors, "skip-errors", false, "Skip files that do not parse cleanly")
 
 	// url options
 	flag.BoolVarP(&opts.includeSource, "include-source", "S", false, "Include the source code where the URL was found")
@@ -153,6 +190,7 @@ func main() {
 	flag.Parse()
 
 	opts.headers = headers
+	opts.stats = &runStats{}
 
 	if opts.help {
 		flag.Usage()
@@ -173,6 +211,21 @@ func main() {
 
 	mode := args[0]
 	files := args[1:]
+
+	// A shared resolver lets the static evaluator follow relative imports so
+	// that constants defined in another module are reconstructed. It only
+	// reads local files.
+	opts.resolver = jsluice.NewModuleResolver()
+	defer opts.resolver.Close()
+
+	// Expand any directory arguments into the JavaScript files they contain,
+	// while leaving ordinary file paths (and remote URLs) untouched. This
+	// keeps the single-file input path exactly as it was.
+	files, dirErr := expandDirectories(files)
+	if dirErr != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", dirErr)
+		os.Exit(1)
+	}
 
 	// spin up an output worker
 	output := make(chan string)
@@ -240,6 +293,12 @@ func main() {
 					continue
 				}
 
+				if opts.skipErrors && !isRemotePath(filename) &&
+					jsluice.NewAnalyzer(source).HasSyntaxError() {
+					opts.stats.skipSyntax()
+					continue
+				}
+
 				modeFn(opts, filename, source, output, errs)
 			}
 		}()
@@ -286,6 +345,13 @@ func main() {
 	close(jobs)
 
 	wg.Wait()
+
+	// Report the number of files skipped for syntax errors, if any. This goes
+	// to stderr only and never changes the exit code.
+	if skipped := opts.stats.skipped(); skipped > 0 {
+		fmt.Fprintf(os.Stderr, "skipped %d file(s) with syntax errors\n", skipped)
+	}
+
 	done <- struct{}{}
 	close(output)
 	close(errs)
@@ -389,4 +455,63 @@ func readWARCFile(filename string) ([]warcResponse, error) {
 	}
 
 	return out, nil
+}
+
+// isRemotePath reports whether a path is fetched over HTTP rather than read
+// from the local filesystem.
+func isRemotePath(path string) bool {
+	return strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://")
+}
+
+// expandDirectories replaces directory arguments with the JavaScript files
+// they contain, recursively. Non-directory arguments (files and remote URLs)
+// are passed through unchanged and in order. Directory contents are sorted so
+// repeated runs over the same tree produce identical output.
+func expandDirectories(paths []string) ([]string, error) {
+	var out []string
+	for _, p := range paths {
+		if isRemotePath(p) {
+			out = append(out, p)
+			continue
+		}
+		info, err := os.Stat(p)
+		if err != nil || !info.IsDir() {
+			// Not a directory (or not statable): keep the original argument
+			// so the existing per-file error handling is unchanged.
+			out = append(out, p)
+			continue
+		}
+		var found []string
+		err = filepath.WalkDir(p, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				// A single unreadable entry must not abort the whole walk.
+				return nil
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if isJavaScriptFile(path) {
+				found = append(found, path)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		sort.Strings(found)
+		out = append(out, found...)
+	}
+	return out, nil
+}
+
+// isJavaScriptFile reports whether path has an extension jsluice analyses by
+// default. Extensionless inputs are not picked up from a directory walk
+// (that could pull in arbitrary files), though they remain valid explicit
+// arguments.
+func isJavaScriptFile(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".js", ".mjs", ".cjs", ".jsx":
+		return true
+	}
+	return false
 }

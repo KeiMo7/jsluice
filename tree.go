@@ -25,6 +25,11 @@ type Node struct {
 	node        *sitter.Node
 	source      []byte
 	captureName string
+
+	// analyzer, when set, provides the static evaluator used by
+	// CollapsedString. It is optional: nodes created standalone fall back
+	// to the legacy local collapsing behavior.
+	analyzer *Analyzer
 }
 
 // NewNode creates a new Node for the provided tree-sitter
@@ -35,6 +40,27 @@ func NewNode(n *sitter.Node, source []byte) *Node {
 	return &Node{
 		node:   n,
 		source: source,
+	}
+}
+
+// withAnalyzer returns a copy of the Node carrying the Analyzer reference
+// needed for cross-node static evaluation.
+func (n *Node) withAnalyzer(a *Analyzer) *Node {
+	return &Node{
+		node:        n.node,
+		source:      n.source,
+		captureName: n.captureName,
+		analyzer:    a,
+	}
+}
+
+// wrap creates a Node for a child tree-sitter node, propagating the analyzer
+// reference so static evaluation remains available.
+func (n *Node) wrap(child *sitter.Node) *Node {
+	return &Node{
+		node:     child,
+		source:   n.source,
+		analyzer: n.analyzer,
 	}
 }
 
@@ -68,7 +94,7 @@ func (n *Node) ChildByFieldName(name string) *Node {
 	if !n.IsValid() {
 		return nil
 	}
-	return NewNode(n.node.ChildByFieldName(name), n.source)
+	return n.wrap(n.node.ChildByFieldName(name))
 }
 
 // Child returns the child Node at the provided index
@@ -76,7 +102,7 @@ func (n *Node) Child(index int) *Node {
 	if !n.IsValid() {
 		return nil
 	}
-	return NewNode(n.node.Child(index), n.source)
+	return n.wrap(n.node.Child(index))
 }
 
 // NamedChild returns the 'named' child Node at the provided
@@ -89,7 +115,7 @@ func (n *Node) NamedChild(index int) *Node {
 	if !n.IsValid() {
 		return nil
 	}
-	return NewNode(n.node.NamedChild(index), n.source)
+	return n.wrap(n.node.NamedChild(index))
 }
 
 // ChildCount returns the number of children a node has
@@ -138,7 +164,7 @@ func (n *Node) NextSibling() *Node {
 	if !n.IsValid() {
 		return nil
 	}
-	return NewNode(n.node.NextSibling(), n.source)
+	return n.wrap(n.node.NextSibling())
 }
 
 // NextNamedSibling returns the next named sibling in the tree
@@ -146,7 +172,7 @@ func (n *Node) NextNamedSibling() *Node {
 	if !n.IsValid() {
 		return nil
 	}
-	return NewNode(n.node.NextNamedSibling(), n.source)
+	return n.wrap(n.node.NextNamedSibling())
 }
 
 // PrevSibling returns the previous sibling in the tree
@@ -154,7 +180,7 @@ func (n *Node) PrevSibling() *Node {
 	if !n.IsValid() {
 		return nil
 	}
-	return NewNode(n.node.PrevSibling(), n.source)
+	return n.wrap(n.node.PrevSibling())
 }
 
 // PrevNamedSibling returns the previous named sibling in the tree
@@ -162,7 +188,7 @@ func (n *Node) PrevNamedSibling() *Node {
 	if !n.IsValid() {
 		return nil
 	}
-	return NewNode(n.node.PrevNamedSibling(), n.source)
+	return n.wrap(n.node.PrevNamedSibling())
 }
 
 // CollapsedString takes a node representing a URL and attempts to make it
@@ -175,8 +201,43 @@ func (n *Node) PrevNamedSibling() *Node {
 //
 //  ./upload.php?profile=EXPR&show=EXPR
 //
-// The value of ExpressionPlaceholder is used as a placeholder, defaulting to 'EXPR'
+// The value of ExpressionPlaceholder is used as a placeholder, defaulting to 'EXPR'.
+//
+// When the Node is attached to an Analyzer, CollapsedString uses the
+// analyzer's conservative static evaluator: constants (including those
+// declared elsewhere in the file or imported from another module), template
+// strings, array joins and object properties are resolved before any
+// placeholder is emitted. Nodes created without an Analyzer retain the
+// original local behavior.
 func (n *Node) CollapsedString() string {
+	if !n.IsValid() {
+		return ""
+	}
+	if n.analyzer != nil {
+		return n.analyzer.EvalStaticString(n)
+	}
+	return n.collapsedStringLocal()
+}
+
+// StaticValue returns the full provenance-carrying result of statically
+// evaluating the node. It requires the node to be attached to an Analyzer;
+// standalone nodes fall back to local collapsing wrapped in a StaticValue.
+func (n *Node) StaticValue() StaticValue {
+	if !n.IsValid() {
+		return StaticValue{Unknown: true}
+	}
+	if n.analyzer != nil {
+		return n.analyzer.EvalStatic(n)
+	}
+	return StaticValue{Parts: []StaticPart{{
+		Value:  n.collapsedStringLocal(),
+		Source: n.Content(),
+	}}}
+}
+
+// collapsedStringLocal is the original, purely local collapsing logic that
+// only understands binary expressions and string literals.
+func (n *Node) collapsedStringLocal() string {
 	if !n.IsValid() {
 		return ""
 	}
@@ -184,8 +245,8 @@ func (n *Node) CollapsedString() string {
 	case "binary_expression":
 		return fmt.Sprintf(
 			"%s%s",
-			n.ChildByFieldName("left").CollapsedString(),
-			n.ChildByFieldName("right").CollapsedString(),
+			n.ChildByFieldName("left").collapsedStringLocal(),
+			n.ChildByFieldName("right").collapsedStringLocal(),
 		)
 	case "string":
 		return n.RawString()
@@ -325,7 +386,7 @@ func (n *Node) Parent() *Node {
 	if !n.IsValid() {
 		return nil
 	}
-	return NewNode(n.node.Parent(), n.source)
+	return n.wrap(n.node.Parent())
 }
 
 // IsNamed returns true if the underlying node is named
@@ -342,7 +403,7 @@ func (n *Node) ForEachChild(fn func(*Node)) {
 	it := sitter.NewIterator(n.node, sitter.DFSMode)
 
 	it.ForEach(func(sn *sitter.Node) error {
-		fn(NewNode(sn, n.source))
+		fn(n.wrap(sn))
 		return nil
 	})
 }
@@ -353,7 +414,7 @@ func (n *Node) ForEachNamedChild(fn func(*Node)) {
 	it := sitter.NewNamedIterator(n.node, sitter.DFSMode)
 
 	it.ForEach(func(sn *sitter.Node) error {
-		fn(NewNode(sn, n.source))
+		fn(n.wrap(sn))
 		return nil
 	})
 }
@@ -453,7 +514,7 @@ func (n *Node) QueryMulti(query string, fn func(QueryResult)) {
 		qr := NewQueryResult()
 
 		for _, capture := range match.Captures {
-			node := NewNode(capture.Node, n.source)
+			node := n.wrap(capture.Node)
 			node.captureName = q.CaptureNameForId(capture.Index)
 			qr.Add(node)
 		}
@@ -483,6 +544,22 @@ func (n *Node) IsStringy() bool {
 	default:
 		return false
 	}
+}
+
+// HasStaticString reports whether conservative static evaluation can produce
+// at least one concrete string fragment for the node. Unlike IsStringy, this
+// does not require the expression to begin with a literal: an expression such
+// as BASE + "/login", where BASE is a string constant, also qualifies. URL
+// matchers use it to accept expressions the static evaluator can partially
+// resolve. A wholly runtime-dependent expression still returns false.
+func (n *Node) HasStaticString() bool {
+	if !n.IsValid() {
+		return false
+	}
+	if n.analyzer == nil {
+		return n.IsStringy()
+	}
+	return n.analyzer.EvalStatic(n).HasKnownFragment()
 }
 
 // CaptureName returns the name given to a node in a

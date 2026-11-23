@@ -3,7 +3,11 @@ package jsluice
 import (
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
+
+	"golang.org/x/exp/constraints"
+	"golang.org/x/exp/slices"
 )
 
 // A URL is any URL found in the source code with accompanying details
@@ -23,6 +27,11 @@ type URL struct {
 
 	// the filename in which the match was found
 	Filename string `json:"filename,omitempty"`
+
+	// sourceNode is the node whose value produced URL. It is unexported and
+	// not serialized; it lets GetURLs expand a branch-dependent expression
+	// into one result per possible value.
+	sourceNode *Node
 }
 
 // GetURLs searches the JavaScript source code for absolute and relative URLs and returns
@@ -94,6 +103,25 @@ func (a *Analyzer) GetURLs() []*URL {
 			}
 			match.QueryParams = unique(match.QueryParams)
 
+			// A branch-dependent expression such as `cond ? A : B` has
+			// more than one possible value. Report one result per distinct
+			// value so callers see every URL the code can build, not just
+			// the first. The primary value is the first alternative.
+			alts := a.staticAlternatives(match)
+			if len(alts) <= 1 {
+				matches = append(matches, match)
+				continue
+			}
+			for _, alt := range alts {
+				if alt == match.URL {
+					continue
+				}
+				u := *match
+				u.URL = alt
+				u.QueryParams = a.queryParamNames(alt, u.QueryParams)
+				u.sourceNode = match.sourceNode
+				matches = append(matches, &u)
+			}
 			matches = append(matches, match)
 		}
 	}
@@ -104,17 +132,61 @@ func (a *Analyzer) GetURLs() []*URL {
 	return matches
 }
 
-func unique[T comparable](items []T) []T {
+// staticAlternatives returns every distinct rendering of the value that
+// produced a URL match. It returns just the match's own URL for ordinary
+// (single-valued) matches. Results are sorted and de-duplicated.
+func (a *Analyzer) staticAlternatives(m *URL) []string {
+	if m == nil || m.sourceNode == nil || !m.sourceNode.IsValid() {
+		return []string{m.URL}
+	}
+	vals := a.EvalStatic(m.sourceNode).AllStrings()
+	out := make([]string, 0, len(vals))
+	seen := make(map[string]struct{}, len(vals))
+	for _, v := range vals {
+		v = DecodeString(v)
+		if v == m.URL {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return append([]string{m.URL}, out...)
+}
+
+// queryParamNames augments base with the query parameter names present in raw,
+// without duplicating an existing entry.
+func (a *Analyzer) queryParamNames(raw string, base []string) []string {
+	out := append([]string(nil), base...)
+	u, err := url.Parse(raw)
+	if err != nil {
+		return out
+	}
+	for p := range u.Query() {
+		if p == ExpressionPlaceholder {
+			continue
+		}
+		out = append(out, p)
+	}
+	return unique(out)
+}
+
+func unique[T constraints.Ordered](items []T) []T {
 	set := make(map[T]any)
 	for _, item := range items {
 		set[item] = struct{}{}
 	}
-	out := make([]T, len(set))
-	i := 0
-	for item, _ := range set {
-		out[i] = item
-		i++
+	out := make([]T, 0, len(set))
+	for item := range set {
+		out = append(out, item)
 	}
+	// Sort so output is deterministic across runs. Go map iteration order is
+	// randomized, which would otherwise make repeated analyses of the same
+	// file differ byte-for-byte (e.g. query parameter ordering).
+	slices.Sort(out)
 	return out
 }
 
@@ -197,15 +269,16 @@ func AllURLMatchers() []URLMatcher {
 			//
 			// So while we might miss out on some things this way, they probably wouldn't
 			// have been super useful to anything automated anyway.
-			if !right.IsStringy() {
+			if !right.HasStaticString() {
 				return nil
 			}
 
 			return &URL{
-				URL:    right.CollapsedString(),
-				Method: "GET",
-				Type:   "locationAssignment",
-				Source: n.Content(),
+				URL:        right.CollapsedString(),
+				Method:     "GET",
+				Type:       "locationAssignment",
+				Source:     n.Content(),
+				sourceNode: right,
 			}
 		}},
 
@@ -220,15 +293,16 @@ func AllURLMatchers() []URLMatcher {
 			arguments := n.ChildByFieldName("arguments")
 
 			// check the argument contains at least one string literal
-			if !arguments.NamedChild(0).IsStringy() {
+			if !arguments.NamedChild(0).HasStaticString() {
 				return nil
 			}
 
 			return &URL{
-				URL:    arguments.NamedChild(0).CollapsedString(),
-				Method: "GET",
-				Type:   "locationReplacement",
-				Source: n.Content(),
+				URL:        arguments.NamedChild(0).CollapsedString(),
+				Method:     "GET",
+				Type:       "locationReplacement",
+				Source:     n.Content(),
+				sourceNode: arguments.NamedChild(0),
 			}
 		}},
 
@@ -241,15 +315,16 @@ func AllURLMatchers() []URLMatcher {
 			arguments := n.ChildByFieldName("arguments")
 
 			// check the argument contains at least one string literal
-			if !arguments.NamedChild(0).IsStringy() {
+			if !arguments.NamedChild(0).HasStaticString() {
 				return nil
 			}
 
 			return &URL{
-				URL:    arguments.NamedChild(0).CollapsedString(),
-				Method: "GET",
-				Type:   "window.open",
-				Source: n.Content(),
+				URL:        arguments.NamedChild(0).CollapsedString(),
+				Method:     "GET",
+				Type:       "window.open",
+				Source:     n.Content(),
+				sourceNode: arguments.NamedChild(0),
 			}
 			return nil
 		}},
@@ -263,7 +338,7 @@ func AllURLMatchers() []URLMatcher {
 			arguments := n.ChildByFieldName("arguments")
 
 			// check the argument contains at least one string literal
-			if !arguments.NamedChild(0).IsStringy() {
+			if !arguments.NamedChild(0).HasStaticString() {
 				return nil
 			}
 
@@ -276,6 +351,7 @@ func AllURLMatchers() []URLMatcher {
 				ContentType: init.GetObject("headers").GetStringI("content-type", ""),
 				Type:        "fetch",
 				Source:      n.Content(),
+				sourceNode:  arguments.NamedChild(0),
 			}
 			return nil
 		}},
@@ -285,7 +361,7 @@ func AllURLMatchers() []URLMatcher {
 			callName := n.ChildByFieldName("function").Content()
 
 			arguments := n.ChildByFieldName("arguments")
-			if !arguments.NamedChild(0).IsStringy() {
+			if !arguments.NamedChild(0).HasStaticString() {
 				return nil
 			}
 
@@ -294,9 +370,10 @@ func AllURLMatchers() []URLMatcher {
 			}
 
 			return &URL{
-				URL:    arguments.NamedChild(0).CollapsedString(),
-				Type:   callName,
-				Source: n.Content(),
+				URL:        arguments.NamedChild(0).CollapsedString(),
+				Type:       callName,
+				Source:     n.Content(),
+				sourceNode: arguments.NamedChild(0),
 			}
 		}},
 

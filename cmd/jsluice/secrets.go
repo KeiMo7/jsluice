@@ -10,6 +10,10 @@ import (
 
 func extractSecrets(opts options, filename string, source []byte, output chan string, errs chan error) {
 	analyzer := jsluice.NewAnalyzer(source)
+	if !isRemotePath(filename) {
+		analyzer.SetFilename(filename)
+		analyzer.SetModuleResolver(opts.resolver)
+	}
 
 	// TODO: come up with a nice way to cache the patterns file and
 	// only throw any open or parse errors once

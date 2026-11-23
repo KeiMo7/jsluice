@@ -23,6 +23,14 @@ func extractURLs(opts options, filename string, source []byte, output chan strin
 	seen := make(map[string]any, 0)
 
 	analzyer := jsluice.NewAnalyzer(source)
+	// For local files, allow the static evaluator to follow relative
+	// imports. This is read-only filesystem access; nothing is executed and
+	// no network request is made. Remote and WARC inputs have no local
+	// location to resolve against, so they keep placeholders for imports.
+	if !isRemotePath(filename) {
+		analzyer.SetFilename(filename)
+		analzyer.SetModuleResolver(opts.resolver)
+	}
 	for _, m := range analzyer.GetURLs() {
 		if opts.ignoreStrings && m.Type == "stringLiteral" {
 			continue

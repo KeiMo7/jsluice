@@ -59,9 +59,10 @@ func matchJQuery() URLMatcher {
 
 		var settingsNode *Node
 
-		if firstArg.IsStringy() {
+		if firstArg.HasStaticString() {
 			// first argument is the URL
 			m.URL = firstArg.CollapsedString()
+			m.sourceNode = firstArg
 
 			// If the first arg is a URL, the second arg is a
 			// settings object for $.ajax, or a data object for
@@ -93,7 +94,9 @@ func matchJQuery() URLMatcher {
 		settings := settingsNode.AsObject()
 
 		if m.URL == "" {
-			m.URL = settings.GetNode("url").CollapsedString()
+			urlNode := settings.GetNode("url")
+			m.URL = urlNode.CollapsedString()
+			m.sourceNode = urlNode
 		}
 
 		headers := settings.GetObject("headers")

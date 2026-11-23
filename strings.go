@@ -187,7 +187,14 @@ func (s *stringLexer) String() string {
 //   foo\075bar -> foo=bar // Octal escape
 //   foo\"bar -> foo"bar // Single character escapes
 func DecodeString(in string) string {
-	in = dequote(in)
+	return decodeEscapes(dequote(in))
+}
+
+// decodeEscapes converts the escape sequences in a JavaScript string body.
+// Unlike DecodeString it does not strip surrounding quotes, which makes it
+// suitable for decoding individual fragments (such as the literal text
+// between template-string substitutions) that never had quotes of their own.
+func decodeEscapes(in string) string {
 	l := newStringLexer(in)
 
 	validHex := "0123456789abcdefABCDEF"
